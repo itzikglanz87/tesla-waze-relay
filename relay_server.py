@@ -394,9 +394,12 @@ class Handler(BaseHTTPRequestHandler):
                     after_i = int(after)
                 except ValueError:
                     after_i = -1
-                if blob is None or seq <= after_i:
+                # "different", not "greater": the relay restarts its counter
+                # whenever Render recycles it, and a client still holding a
+                # high number must be served, not spun.
+                if blob is None or seq == after_i:
                     blob, seq, ts = S.wait_for_new(after_i, 15.0)
-                if blob is None or seq <= after_i:
+                if blob is None or seq == after_i:
                     self.send_response(204)       # nothing new; ask again
                     self.send_header("Cache-Control", "no-store")
                     if cookie:
@@ -427,6 +430,7 @@ class Handler(BaseHTTPRequestHandler):
             with S.cond:
                 payload = {
                     "uptime_s": round(up, 1),
+                    "seq": S.seq,
                     "frames_in": S.frames_in,
                     "mb_in": round(S.bytes_in / 1048576.0, 2),
                     "mb_out": round(S.bytes_out / 1048576.0, 2),
