@@ -225,7 +225,7 @@ class Poster:
             pass
         self.conn = None
 
-    def post(self, path, body, ctype):
+    def post(self, path, body, ctype, stale=False):
         last = None
         for attempt in (0, 1):      # one retry: an idle socket may have died
             try:
@@ -235,6 +235,7 @@ class Poster:
                     "Content-Type": ctype,
                     "Content-Length": str(len(body)),
                     "X-Token": self.token,
+                    "X-Stale": "1" if stale else "0",
                     "Connection": "keep-alive",
                     "User-Agent": "teslawaze-pusher"})
                 resp = self.conn.getresponse()
@@ -273,7 +274,7 @@ def sender(relay, token, fps, slot, stop, count):
         if frame is not None and (fresh or due):
             try:
                 t1 = time.time()
-                poster.post("/push", frame, "image/jpeg")
+                poster.post("/push", frame, "image/jpeg", stale=not fresh)
                 count.post_ms += (time.time() - t1) * 1000.0
                 count.sent += 1
                 count.bytes += len(frame)

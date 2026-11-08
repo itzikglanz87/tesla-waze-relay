@@ -45,7 +45,8 @@ class State:
         self.cond = threading.Condition()
         self.jpeg = None
         self.seq = 0
-        self.frame_ts = 0.0
+        self.frame_ts = 0.0      # last frame of any kind
+        self.fresh_ts = 0.0      # last frame that was NEW on the phone
         self.overlay = {}
         self.data_ts = 0.0
         self.bytes_in = 0
@@ -54,11 +55,13 @@ class State:
         self.viewers = 0
         self.started = time.time()
 
-    def push_frame(self, blob):
+    def push_frame(self, blob, fresh=True):
         with self.cond:
             self.jpeg = blob
             self.seq += 1
             self.frame_ts = time.time()
+            if fresh:
+                self.fresh_ts = self.frame_ts
             self.bytes_in += len(blob)
             self.frames_in += 1
             self.cond.notify_all()
@@ -234,15 +237,22 @@ VIEWER_HTML = r"""<!doctype html>
         man.textContent  = pick(o, ['maneuver','instruction','next_turn','turn','text']);
         eta.textContent  = pick(o, ['eta','arrival','eta_text','summary','remaining']);
         dist.classList.toggle('weak', pick(o,['distance_source']) === 'summary');
-        var fa = d.frame_age;
+        var fa = d.frame_age, sa = d.source_age;
         watchdog(fa !== null && fa < 3);
         if (Date.now() < noticeUntil) {
           msg.style.display = 'block';
           msg.textContent = noticeText;
-        } else if (fa === null || fa > 6) {
+        } else if (fa === null) {
           msg.style.display = 'block';
-          msg.textContent = (fa === null) ? 'no frames — phone is not pushing'
-                                          : 'last frame ' + Math.round(fa) + 's ago';
+          msg.textContent = 'no frames — phone is not pushing';
+        } else if (sa === null || sa > 10) {
+          // frames may still be arriving, but they are resends of an old one
+          msg.style.display = 'block';
+          msg.textContent = 'ScreenStream stopped — picture frozen '
+                          + (sa === null ? '' : Math.round(sa) + 's');
+        } else if (fa > 6) {
+          msg.style.display = 'block';
+          msg.textContent = 'last frame ' + Math.round(fa) + 's ago';
         } else {
           msg.style.display = 'none';
         }
@@ -365,6 +375,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload = {
                     "overlay": S.overlay,
                     "frame_age": age(S.frame_ts),
+                    "source_age": age(S.fresh_ts),
                     "data_age": age(S.data_ts),
                     "seq": S.seq,
                 }
@@ -381,6 +392,7 @@ class Handler(BaseHTTPRequestHandler):
                     "avg_fps_in": round(S.frames_in / up, 2) if up > 0 else 0,
                     "avg_kbps_in": round(S.bytes_in * 8 / 1000.0 / up, 1) if up > 0 else 0,
                     "frame_age": age(S.frame_ts),
+                    "source_age": age(S.fresh_ts),
                     "data_age": age(S.data_ts),
                     "viewers": S.viewers,
                     "last_frame_bytes": len(S.jpeg) if S.jpeg else 0,
@@ -450,7 +462,10 @@ class Handler(BaseHTTPRequestHandler):
             if not blob.startswith(b"\xff\xd8"):
                 self._send(400, "not a jpeg\n")
                 return
-            S.push_frame(blob)
+            # the pusher marks a frame it is only resending to hold the
+            # connection open; without that a dead phone looks like a live one
+            stale = (self.headers.get("X-Stale") or "").strip() == "1"
+            S.push_frame(blob, fresh=not stale)
             self._send(200, "ok\n")
 
         elif path == "/push-data":
