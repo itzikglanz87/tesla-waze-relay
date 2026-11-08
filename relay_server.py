@@ -119,6 +119,8 @@ VIEWER_HTML = r"""<!doctype html>
    background:#2a2f36;color:#fff;font-weight:600;padding:0 8px}
  button:active{background:#4a525d}
  button.on{background:#2e6fd6}
+ /* Tesla's browser has no glyph for the usual symbols; words always render */
+ button.lbl{font-size:16px;min-width:74px;letter-spacing:.5px}
  #msg{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
    font-size:26px;background:rgba(0,0,0,.72);padding:14px 22px;border-radius:12px;
    display:none;text-align:center;max-width:70%}
@@ -139,30 +141,32 @@ VIEWER_HTML = r"""<!doctype html>
   <button id="bdn">&#9660;</button>
   <button id="blf">&#9664;</button>
   <button id="brt">&#9654;</button>
-  <button id="bdim">&#9790;</button>
-  <button id="bov">A</button>
-  <button id="bmode">P</button>
-  <button id="brst">&#8962;</button>
-  <button id="brld">&#10227;</button>
+  <button id="bdim" class="lbl">DIM</button>
+  <button id="bov" class="lbl">TEXT</button>
+  <button id="bmode" class="lbl">S</button>
+  <button id="brst" class="lbl">RESET</button>
+  <button id="brld" class="lbl">RELOAD</button>
 </div>
 <script>
 (function(){
   var q = new URLSearchParams(location.search);
   var K = q.get('k') || '';
   var kq = K ? ('k=' + encodeURIComponent(K)) : '';
-  var POLL_FPS = 3;
 
   var v = document.getElementById('v'), dim = document.getElementById('dim'),
       ov = document.getElementById('ov'), msg = document.getElementById('msg'),
       dist = document.getElementById('dist'), man = document.getElementById('man'),
       eta = document.getElementById('eta');
 
-  var DEF = {zoom:1, x:0, y:0, dim:0, ov:1, poll:0};
+  // poll:1 by default -- a multipart stream over a slow link falls behind and
+  // never catches up; long polling always shows the newest frame.
+  var DEF = {zoom:1, x:0, y:0, dim:0, ov:1, poll:1};
+  var KEY = 'teslawaze.v2';
   var st = DEF;
-  try { st = Object.assign({}, DEF, JSON.parse(localStorage.getItem('teslawaze.view')||'{}')); }
+  try { st = Object.assign({}, DEF, JSON.parse(localStorage.getItem(KEY)||'{}')); }
   catch(e) {}
 
-  function save(){ try{ localStorage.setItem('teslawaze.view', JSON.stringify(st)); }catch(e){} }
+  function save(){ try{ localStorage.setItem(KEY, JSON.stringify(st)); }catch(e){} }
 
   function apply(){
     v.style.transform = 'translate(-50%,-50%) translate('+st.x+'px,'+st.y+'px) scale('+st.zoom+')';
@@ -186,17 +190,33 @@ VIEWER_HTML = r"""<!doctype html>
 
   function stopVideo(){
     if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    var old = v.src;
     v.src = '';
+    if (old && old.lastIndexOf('blob:', 0) === 0) URL.revokeObjectURL(old);
+    lastSeq = -1;
   }
 
+  // Long poll: ask for anything newer than what we hold.  The relay answers
+  // the moment a new frame lands, or 204 after a while.  Always the latest
+  // frame, so the picture cannot fall behind and stay behind.
+  var lastSeq = -1;
   function pollOnce(){
-    var img = new Image();
-    img.onload = function(){
-      v.src = img.src;
-      pollTimer = setTimeout(pollOnce, 1000 / POLL_FPS);
-    };
-    img.onerror = function(){ pollTimer = setTimeout(pollOnce, 1500); };
-    img.src = '/frame.jpg?' + kq + '&n=' + Date.now();
+    fetch('/frame.jpg?' + kq + '&after=' + lastSeq, {cache: 'no-store'})
+      .then(function(r){
+        if (r.status === 204) { pollTimer = setTimeout(pollOnce, 150); return null; }
+        if (!r.ok) throw new Error('http ' + r.status);
+        lastSeq = parseInt(r.headers.get('X-Seq') || '-1', 10);
+        return r.blob();
+      })
+      .then(function(b){
+        if (!b) return;
+        var url = URL.createObjectURL(b);
+        var old = v.src;
+        v.src = url;
+        if (old && old.lastIndexOf('blob:', 0) === 0) URL.revokeObjectURL(old);
+        pollTimer = setTimeout(pollOnce, 30);
+      })
+      .catch(function(){ pollTimer = setTimeout(pollOnce, 1200); });
   }
 
   function startVideo(){
@@ -363,7 +383,28 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/stream.mjpeg":
             self._stream(cookie)
         elif path == "/frame.jpg":
+            # With ?after=<seq> this is a long poll: hold the request until a
+            # frame newer than <seq> exists.  The client always gets the
+            # LATEST frame, never a queued one, so lag cannot pile up the way
+            # it does on a multipart stream over a slow link.
+            after = (self._query().get("after") or [None])[0]
             blob, seq, ts = S.snapshot()
+            if after is not None:
+                try:
+                    after_i = int(after)
+                except ValueError:
+                    after_i = -1
+                if blob is None or seq <= after_i:
+                    blob, seq, ts = S.wait_for_new(after_i, 15.0)
+                if blob is None or seq <= after_i:
+                    self.send_response(204)       # nothing new; ask again
+                    self.send_header("Cache-Control", "no-store")
+                    if cookie:
+                        self.send_header(
+                            "Set-Cookie",
+                            "k=%s; Max-Age=31536000; Path=/; SameSite=Lax" % TOKEN)
+                    self.end_headers()
+                    return
             if blob is None:
                 self._send(503, "no frame yet\n", set_cookie=cookie)
             else:

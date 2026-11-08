@@ -27,7 +27,13 @@ import http.client
 import json
 import os
 import socket
+import struct
 import sys
+
+try:
+    import fcntl                 # Linux/Android only; absent on Windows
+except ImportError:
+    fcntl = None
 import threading
 import time
 import urllib.error
@@ -74,15 +80,30 @@ class Slot:
             return self.frame, was_fresh
 
 
+def _iface_ipv4(name):
+    """The IPv4 address bound to one named interface (Linux/Android)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        packed = struct.pack("256s", name.encode("ascii")[:15])
+        return socket.inet_ntoa(
+            fcntl.ioctl(s.fileno(), 0x8915, packed)[20:24])   # SIOCGIFADDR
+    finally:
+        s.close()
+
+
 def local_ipv4s():
     """Every IPv4 address this device currently has, best effort.
 
-    ScreenStream binds to one interface, not to the loopback, so 127.0.0.1 can
-    be refused while the stream is running perfectly on the Wi-Fi or cellular
-    address.  That address changes when the phone moves between networks, so
-    this is re-run on every reconnect rather than once at startup.
+    ScreenStream binds to one interface and not to the loopback, so 127.0.0.1
+    gets refused while the stream runs fine somewhere else.  And the interface
+    it picks is often NOT the one carrying the default route -- a hotspot or a
+    USB tether, say -- so asking "which address reaches the internet" finds the
+    wrong one.  Walk every interface instead.  Re-run on each reconnect,
+    because these addresses change as the phone moves between networks.
     """
     found = []
+
+    # whichever interface carries the default route (cellular, usually)
     for probe in ("8.8.8.8", "1.1.1.1"):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -96,6 +117,21 @@ def local_ipv4s():
                 s.close()
         except Exception:
             pass
+
+    # and every other interface the kernel knows about
+    if fcntl is not None:
+        try:
+            names = [n for _, n in socket.if_nameindex()]
+        except Exception:
+            names = []
+        for name in names:
+            try:
+                ip = _iface_ipv4(name)
+            except Exception:
+                continue
+            if ip and ip not in found:
+                found.append(ip)
+
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None,
                                        socket.AF_INET):
@@ -104,7 +140,8 @@ def local_ipv4s():
                 found.append(ip)
     except Exception:
         pass
-    return [ip for ip in found if not ip.startswith("127.")]
+
+    return [ip for ip in found if not ip.startswith("127.")][:8]
 
 
 def candidate_sources(explicit, port):
@@ -192,14 +229,19 @@ class Poster:
     and shows up as lag on the screen.  So: one connection, held open.
     """
 
-    def __init__(self, relay, token):
+    def __init__(self, relay, token, timeout=8.0):
         u = urllib.parse.urlsplit(relay)
         self.secure = (u.scheme != "http")
         self.host = u.hostname
         self.port = u.port
         self.token = token
+        # Short on purpose.  A stalled upload holds the queue, and when it
+        # finally lands it delivers a frame that is already seconds old.
+        # Better to abandon it and send a fresh one.
+        self.timeout = timeout
         self.conn = None
         self.opens = 0
+        self.timeouts = 0
 
     def _open(self):
         cls = (http.client.HTTPSConnection if self.secure
@@ -211,10 +253,10 @@ class Poster:
             if "//" not in proxy:
                 proxy = "http://" + proxy
             pu = urllib.parse.urlsplit(proxy)
-            self.conn = cls(pu.hostname, pu.port or 80, timeout=20)
+            self.conn = cls(pu.hostname, pu.port or 80, timeout=self.timeout)
             self.conn.set_tunnel(self.host, self.port or 443)
         else:
-            self.conn = cls(self.host, self.port, timeout=20)
+            self.conn = cls(self.host, self.port, timeout=self.timeout)
         self.opens += 1
 
     def close(self):
@@ -248,6 +290,8 @@ class Poster:
             except Forbidden:
                 raise
             except Exception as exc:
+                if isinstance(exc, (socket.timeout, TimeoutError)):
+                    self.timeouts += 1
                 last = exc
                 self.close()
         raise last
@@ -258,12 +302,13 @@ class Counter:
         self.sent = 0
         self.bytes = 0
         self.errors = 0
+        self.timeouts = 0
         self.post_ms = 0.0
         self.last_error = ""
 
 
-def sender(relay, token, fps, slot, stop, count):
-    poster = Poster(relay, token)
+def sender(relay, token, fps, slot, stop, count, timeout=8.0):
+    poster = Poster(relay, token, timeout=timeout)
     interval = 1.0 / fps
     keepalive = 8.0          # resend an unchanged frame this often, so the car
     last_sent = 0.0          # does not think the phone went away
@@ -285,8 +330,9 @@ def sender(relay, token, fps, slot, stop, count):
                 return
             except Exception as exc:
                 count.errors += 1
+                count.timeouts = poster.timeouts
                 count.last_error = str(exc)
-                stop.wait(1.0)
+                stop.wait(0.3)
         rest = interval - (time.time() - t0)
         if rest > 0:
             stop.wait(rest)
@@ -329,7 +375,8 @@ def reporter(slot, count, stop, fps):
                 % (count.sent, mb, mb / (up / 60.0), count.bytes * 8 / 1000.0 / up,
                    count.sent / up, avg_post, slot.received, slot.dropped))
         if count.errors:
-            line += ", %d errors (last: %s)" % (count.errors, count.last_error)
+            line += (", %d errors (%d timeouts; last: %s)"
+                     % (count.errors, count.timeouts, count.last_error))
         log(line)
 
 
@@ -350,6 +397,9 @@ def main():
                     help="where the Waze overlay JSON is served")
     ap.add_argument("--no-data", action="store_true",
                     help="do not forward the overlay JSON at all")
+    ap.add_argument("--post-timeout", type=float, default=8.0,
+                    help="seconds before a stalled upload is abandoned and a "
+                         "fresher frame is sent instead (default 8)")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
     QUIET = args.quiet
@@ -381,7 +431,8 @@ def main():
         threading.Thread(target=reader,
                          args=(args.source, args.port, slot, stop), daemon=True),
         threading.Thread(target=sender,
-                         args=(args.relay, args.token, args.fps, slot, stop, count),
+                         args=(args.relay, args.token, args.fps, slot, stop,
+                               count, args.post_timeout),
                          daemon=True),
         threading.Thread(target=reporter, args=(slot, count, stop, args.fps),
                          daemon=True),
