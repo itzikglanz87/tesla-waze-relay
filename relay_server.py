@@ -175,6 +175,11 @@ VIEWER_HTML = r"""<!doctype html>
 
   // ---- pixels -------------------------------------------------------------
   var pollTimer = null;
+  var videoStart = 0;        // when the current <img> source was attached
+  var autoSwitched = false;  // only fall back on our own once per choice
+  var noticeUntil = 0, noticeText = '';
+
+  function notice(t){ noticeText = t; noticeUntil = Date.now() + 5000; }
 
   function stopVideo(){
     if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
@@ -193,8 +198,22 @@ VIEWER_HTML = r"""<!doctype html>
 
   function startVideo(){
     stopVideo();
+    videoStart = Date.now();
     if (st.poll) { pollOnce(); }
     else { v.src = '/stream.mjpeg?' + kq + '&t=' + Date.now(); }
+  }
+
+  // Chromium may accept a multipart response and then simply never paint it
+  // -- no error event, no picture.  If the relay says frames are arriving but
+  // nothing has decoded after a few seconds, drop to single-frame polling.
+  function watchdog(freshFrames){
+    if (st.poll || autoSwitched) return;
+    if (!freshFrames) return;
+    if (v.naturalWidth > 0) return;
+    if (Date.now() - videoStart < 6000) return;
+    autoSwitched = true;
+    st.poll = 1; apply(); startVideo();
+    notice('stream did not render — switched to poll mode (P)');
   }
 
   // ---- overlay ------------------------------------------------------------
@@ -216,10 +235,14 @@ VIEWER_HTML = r"""<!doctype html>
         eta.textContent  = pick(o, ['eta','arrival','eta_text','summary','remaining']);
         dist.classList.toggle('weak', pick(o,['distance_source']) === 'summary');
         var fa = d.frame_age;
-        if (fa === null || fa > 6) {
+        watchdog(fa !== null && fa < 3);
+        if (Date.now() < noticeUntil) {
           msg.style.display = 'block';
-          msg.textContent = (fa === null) ? 'אין פריימים — הטלפון לא דוחף'
-                                          : 'הפריים האחרון לפני ' + Math.round(fa) + ' שניות';
+          msg.textContent = noticeText;
+        } else if (fa === null || fa > 6) {
+          msg.style.display = 'block';
+          msg.textContent = (fa === null) ? 'no frames — phone is not pushing'
+                                          : 'last frame ' + Math.round(fa) + 's ago';
         } else {
           msg.style.display = 'none';
         }
@@ -227,7 +250,7 @@ VIEWER_HTML = r"""<!doctype html>
       })
       .catch(function(){
         msg.style.display = 'block';
-        msg.textContent = 'אין קשר לממסר';
+        msg.textContent = 'relay unreachable';
         setTimeout(tick, 2000);
       });
   }
@@ -243,7 +266,8 @@ VIEWER_HTML = r"""<!doctype html>
   on('brt',  function(){ st.x += STEP; apply(); });
   on('bdim', function(){ st.dim = st.dim ? 0 : 1; apply(); });
   on('bov',  function(){ st.ov  = st.ov  ? 0 : 1; apply(); });
-  on('bmode',function(){ st.poll = st.poll ? 0 : 1; apply(); startVideo(); });
+  on('bmode',function(){ st.poll = st.poll ? 0 : 1; autoSwitched = false;
+                         apply(); startVideo(); });
   on('brst', function(){ st = Object.assign({}, DEF); apply(); startVideo(); });
   on('brld', function(){ startVideo(); });
 
