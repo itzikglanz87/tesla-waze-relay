@@ -1,0 +1,2 @@
+# No dependencies -- relay_server.py is pure standard library.
+# This file exists only so Render's default build command succeeds.

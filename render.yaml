@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: tesla-waze-relay
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python relay_server.py"
+    healthCheckPath: /health
+    envVars:
+      - key: RELAY_TOKEN
+        sync: false          # set this yourself in the Render dashboard
+      - key: PYTHON_VERSION
+        value: "3.11.9"
