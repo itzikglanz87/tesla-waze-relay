@@ -91,6 +91,33 @@ def _iface_ipv4(name):
         s.close()
 
 
+def _ifconf_ipv4s(max_ifaces=48):
+    """Every configured IPv4 address, in one SIOCGIFCONF call.
+
+    socket.if_nameindex() reads /proc/net, which Android has restricted for
+    ordinary apps since Android 10 -- so on a phone it can come back empty or
+    short.  This asks the kernel through the socket instead, which is the
+    older path and more likely to be allowed.
+    """
+    import array
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        size = max_ifaces * 40
+        buf = array.array("B", b"\0" * size)
+        out = struct.unpack("iL", fcntl.ioctl(
+            s.fileno(), 0x8912,                               # SIOCGIFCONF
+            struct.pack("iL", size, buf.buffer_info()[0])))[0]
+        raw = buf.tobytes()
+        found = []
+        for i in range(0, min(out, size), 40):
+            ip = socket.inet_ntoa(raw[i + 20:i + 24])
+            if ip and ip not in found:
+                found.append(ip)
+        return found
+    finally:
+        s.close()
+
+
 def local_ipv4s():
     """Every IPv4 address this device currently has, best effort.
 
@@ -118,8 +145,15 @@ def local_ipv4s():
         except Exception:
             pass
 
-    # and every other interface the kernel knows about
+    # and every other interface the kernel will admit to, by two routes,
+    # because Android allows one or the other depending on the version
     if fcntl is not None:
+        try:
+            for ip in _ifconf_ipv4s():
+                if ip not in found:
+                    found.append(ip)
+        except Exception:
+            pass
         try:
             names = [n for _, n in socket.if_nameindex()]
         except Exception:
@@ -420,6 +454,16 @@ def main():
     except Exception as exc:
         log("relay NOT reachable (%s) -- starting anyway and will retry" % exc)
 
+    if not args.source and fcntl is not None:
+        try:
+            a = _ifconf_ipv4s()
+        except Exception as exc:
+            a = "failed (%s)" % exc
+        try:
+            b = [n for _, n in socket.if_nameindex()]
+        except Exception as exc:
+            b = "failed (%s)" % exc
+        log("interface scan: SIOCGIFCONF=%s  if_nameindex=%s" % (a, b))
     log("source candidates: %s"
         % ", ".join(candidate_sources(args.source, args.port)))
 
